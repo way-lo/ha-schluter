@@ -11,11 +11,6 @@ from aioschluter import (
     SchluterApi,
     Thermostat,
 )
-from aioschluter.const import (
-    REGULATION_MODE_AWAY,
-    REGULATION_MODE_MANUAL,
-    REGULATION_MODE_SCHEDULE,
-)
 
 from homeassistant.components.climate import ClimateEntity
 from homeassistant.components.climate.const import (
@@ -24,21 +19,32 @@ from homeassistant.components.climate.const import (
     HVACMode,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import ATTR_TEMPERATURE
-from homeassistant.const import UnitOfTemperature
+from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import (
-    DataUpdateCoordinator,
-    UpdateFailed,
-)
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from . import SchluterData
-from .const import DOMAIN, PRESET_MANUAL, PRESET_SCHEDULE
+from .const import (
+    DOMAIN,
+    MODE_PERMANENT_HOLD,
+    MODE_SCHEDULE,
+    MODE_TEMPORARY_HOLD,
+    PRESET_PERMANENT,
+    PRESET_SCHEDULE,
+    PRESET_TEMPORARY,
+)
 from .entity import SchluterEntity
 
 _LOGGER = logging.getLogger(__name__)
+
+_PRESET_TO_MODE = {
+    PRESET_SCHEDULE: MODE_SCHEDULE,
+    PRESET_TEMPORARY: MODE_TEMPORARY_HOLD,
+    PRESET_PERMANENT: MODE_PERMANENT_HOLD,
+}
+_MODE_TO_PRESET = {mode: preset for preset, mode in _PRESET_TO_MODE.items()}
 
 
 async def async_setup_entry(
@@ -55,16 +61,17 @@ async def async_setup_entry(
 
 
 class SchluterThermostat(SchluterEntity, ClimateEntity):
-    """Define an Schluter Thermostat Entity."""
+    """Define an Schluter Thermostat Entity.
 
-    _attr_hvac_modes = [HVACMode.HEAT, HVACMode.AUTO, HVACMode.OFF]
+    HVAC modes: Auto = follow the schedule, Heat = hold (use the presets to
+    pick Temporary or Permanent). The thermostat has no remote "off".
+    """
+
+    _attr_hvac_modes = [HVACMode.AUTO, HVACMode.HEAT]
+    _attr_preset_modes = [PRESET_SCHEDULE, PRESET_TEMPORARY, PRESET_PERMANENT]
     _attr_supported_features = (
-        ClimateEntityFeature.TARGET_TEMPERATURE
-        | ClimateEntityFeature.TURN_ON
-        | ClimateEntityFeature.TURN_OFF
-        | ClimateEntityFeature.PRESET_MODE
+        ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.PRESET_MODE
     )
-    _attr_preset_modes = [PRESET_SCHEDULE, PRESET_MANUAL]
     _enable_turn_on_off_backwards_compatibility: bool = False
 
     coordinator: DataUpdateCoordinator[dict[str, dict[str, Thermostat]]]
@@ -84,58 +91,31 @@ class SchluterThermostat(SchluterEntity, ClimateEntity):
         ClimateEntity.__init__(self)
 
     @property
+    def _thermostat(self) -> Thermostat:
+        return self.coordinator.data[self._attr_unique_id]
+
+    @property
     def device_info(self):
         """Information about this entity/device."""
         return {
             "identifiers": {(DOMAIN, self._attr_unique_id)},
-            # If desired, the name for the device could be different to the entity
             "name": self._name,
-            "sw_version": self.coordinator.data[self._attr_unique_id].sw_version,
+            "sw_version": self._thermostat.sw_version,
             "model": "DITRA-HEAT-E-Wifi",
             "manufacturer": "Schluter",
         }
 
     @property
     def hvac_mode(self):
-        if (
-            self.coordinator.data[self._attr_unique_id].regulation_mode
-            == REGULATION_MODE_SCHEDULE
-        ):
-            self._attr_hvac_mode = HVACMode.AUTO
-        elif (
-            self.coordinator.data[self._attr_unique_id].regulation_mode
-            == REGULATION_MODE_MANUAL
-        ):
-            self._attr_hvac_mode = HVACMode.HEAT
-        else:
-            self._attr_hvac_mode = HVACMode.OFF
-        return self._attr_hvac_mode
+        """Auto while following the schedule, Heat while holding."""
+        if self._thermostat.regulation_mode == MODE_SCHEDULE:
+            return HVACMode.AUTO
+        return HVACMode.HEAT
 
     @property
     def preset_mode(self):
-        """Return Schedule/Manual, or None for any other regulation mode."""
-        mode = self.coordinator.data[self._attr_unique_id].regulation_mode
-        if mode == REGULATION_MODE_SCHEDULE:
-            return PRESET_SCHEDULE
-        if mode == REGULATION_MODE_MANUAL:
-            return PRESET_MANUAL
-        return None
-
-    @property
-    def extra_state_attributes(self):
-        """Expose the raw regulation mode for diagnostics."""
-        return {
-            "regulation_mode": self.coordinator.data[
-                self._attr_unique_id
-            ].regulation_mode
-        }
-
-    async def async_set_preset_mode(self, preset_mode: str) -> None:
-        """Switch between schedule and manual."""
-        if preset_mode == PRESET_SCHEDULE:
-            await self.async_set_hvac_mode(HVACMode.AUTO)
-        elif preset_mode == PRESET_MANUAL:
-            await self.async_set_hvac_mode(HVACMode.HEAT)
+        """Schedule, Temporary hold or Permanent hold."""
+        return _MODE_TO_PRESET.get(self._thermostat.regulation_mode)
 
     @property
     def unique_id(self):
@@ -155,75 +135,102 @@ class SchluterThermostat(SchluterEntity, ClimateEntity):
     @property
     def current_temperature(self):
         """Return the current temperature."""
-        return self.coordinator.data[self._attr_unique_id].temperature
+        return self._thermostat.temperature
 
     @property
     def hvac_action(self) -> HVACAction:
         """Return current operation. Can only be heating or idle."""
-        if self.coordinator.data[self._attr_unique_id].is_heating:
+        if self._thermostat.is_heating:
             return HVACAction.HEATING
         return HVACAction.IDLE
 
     @property
     def target_temperature(self):
-        """Return the temperature we try to reach."""
-        return self.coordinator.data[self._attr_unique_id].set_point_temp
+        """Return the temperature the thermostat is aiming for.
+
+        The cloud's set point lags behind a mode change, so in a hold we read
+        the stored hold temperature directly (hundredths of a degree C).
+        """
+        thermostat = self._thermostat
+        mode = thermostat.regulation_mode
+        raw = None
+        if mode == MODE_TEMPORARY_HOLD:
+            raw = getattr(thermostat, "_comfort_temperature", None)
+        elif mode == MODE_PERMANENT_HOLD:
+            raw = getattr(thermostat, "_manual_temp", None)
+        if raw is None:
+            return thermostat.set_point_temp
+        return round(raw / 100, 2)
 
     @property
     def min_temp(self):
         """Identify min_temp in Schluter API."""
-        return self.coordinator.data[self._attr_unique_id].min_temp
+        return self._thermostat.min_temp
 
     @property
     def max_temp(self):
         """Identify max_temp in Schluter API."""
-        return self.coordinator.data[self._attr_unique_id].max_temp
+        return self._thermostat.max_temp
 
-    async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
-        """Set the hvac mode"""
-        serial_number = self.coordinator.data[self._attr_unique_id].serial_number
-        _LOGGER.debug(
-            "Setting HVAC mode of thermostat: %s to: %s", self._name, hvac_mode
+    @property
+    def extra_state_attributes(self):
+        """Diagnostic attributes (degrees C, as reported by the cloud)."""
+        t = self._thermostat
+
+        def _c(raw):
+            """Raw API temps are hundredths of a degree C."""
+            return None if raw is None else round(raw / 100, 2)
+
+        return {
+            "regulation_mode": t.regulation_mode,
+            "manual_temperature_c": _c(getattr(t, "_manual_temp", None)),
+            "comfort_temperature_c": _c(getattr(t, "_comfort_temperature", None)),
+            "comfort_end_time": getattr(t, "_comfort_end_time", None),
+            "set_point_temperature_c": t.set_point_temp,
+            "vacation_enabled": getattr(t, "_vacation_enabled", None),
+            "vacation_temperature_c": _c(getattr(t, "_vacation_temperature", None)),
+        }
+
+    async def _async_send(self, call) -> None:
+        """Run an API call, translating errors, then refresh."""
+        try:
+            await call()
+        except (InvalidUserPasswordError, InvalidSessionIdError) as err:
+            raise ConfigEntryAuthFailed from err
+        except (ApiError, ClientConnectorError) as err:
+            raise HomeAssistantError(f"Schluter request failed: {err}") from err
+        await self.async_refresh_after_command()
+
+    async def _async_set_mode(self, mode: int) -> None:
+        _LOGGER.debug("Setting regulation mode of %s to %s", self._name, mode)
+        await self._async_send(
+            lambda: self._api.async_set_regulation_mode(
+                self._api.sessionid, self._serial_number, mode
+            )
         )
 
+    async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
+        """Auto = schedule, Heat = temporary hold."""
         if hvac_mode == HVACMode.AUTO:
-            regulation_mode = REGULATION_MODE_SCHEDULE
+            await self._async_set_mode(MODE_SCHEDULE)
         elif hvac_mode == HVACMode.HEAT:
-            regulation_mode = REGULATION_MODE_MANUAL
-        else:
-            regulation_mode = REGULATION_MODE_AWAY
+            await self._async_set_mode(MODE_TEMPORARY_HOLD)
 
-        try:
-            await self._api.async_set_regulation_mode(
-                self._api.sessionid, serial_number, regulation_mode
-            )
-            # self._attr_hvac_mode = hvac_mode
-            await self.coordinator.async_request_refresh()
-        except (
-            InvalidUserPasswordError,
-            InvalidSessionIdError,
-        ) as err:
-            raise ConfigEntryAuthFailed from err
-        except (ApiError, ClientConnectorError) as err:
-            raise UpdateFailed(err) from err
+    async def async_set_preset_mode(self, preset_mode: str) -> None:
+        """Choose schedule, temporary hold or permanent hold."""
+        await self._async_set_mode(_PRESET_TO_MODE[preset_mode])
 
     async def async_set_temperature(self, **kwargs):
-        """Set new target temperature."""
+        """Set a permanent hold at the given temperature."""
         target_temp = kwargs.get(ATTR_TEMPERATURE)
-        serial_number = self.coordinator.data[self._attr_unique_id].serial_number
-        _LOGGER.debug("Setting thermostat temperature: %s", target_temp)
-
-        try:
-            if target_temp is not None:
-                await self._api.async_set_temperature(
-                    self._api.sessionid, serial_number, target_temp
-                )
-                # self._attr_hvac_mode = HVACMode.HEAT
-                await self.coordinator.async_request_refresh()
-        except (
-            InvalidUserPasswordError,
-            InvalidSessionIdError,
-        ) as err:
-            raise ConfigEntryAuthFailed from err
-        except (ApiError, ClientConnectorError) as err:
-            raise UpdateFailed(err) from err
+        if target_temp is None:
+            return
+        _LOGGER.debug("Setting permanent hold temperature: %s", target_temp)
+        # The library truncates temp * 100 to an int; avoid float error such
+        # as 14.999999 -> 1499.
+        adjusted = (round(target_temp * 100) + 0.5) / 100
+        await self._async_send(
+            lambda: self._api.async_set_temperature(
+                self._api.sessionid, self._serial_number, adjusted
+            )
+        )

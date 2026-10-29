@@ -3,13 +3,12 @@ from __future__ import annotations
 
 from aiohttp.client_exceptions import ClientConnectorError
 from aioschluter import ApiError, InvalidSessionIdError, InvalidUserPasswordError
-from aioschluter.const import REGULATION_MODE_SCHEDULE
 
 from homeassistant.components.button import ButtonEntity
 from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 
 from . import SchluterData
-from .const import DOMAIN
+from .const import DOMAIN, MODE_SCHEDULE
 from .entity import SchluterEntity
 
 
@@ -44,10 +43,10 @@ class SchluterResumeScheduleButton(SchluterEntity, ButtonEntity):
         """Switch the thermostat back to schedule mode."""
         try:
             await self._api.async_set_regulation_mode(
-                self._api.sessionid, self._serial_number, REGULATION_MODE_SCHEDULE
+                self._api.sessionid, self._serial_number, MODE_SCHEDULE
             )
         except (InvalidUserPasswordError, InvalidSessionIdError) as err:
             raise ConfigEntryAuthFailed from err
         except (ApiError, ClientConnectorError) as err:
             raise HomeAssistantError(f"Could not resume schedule: {err}") from err
-        await self.coordinator.async_request_refresh()
+        await self.async_refresh_after_command()
