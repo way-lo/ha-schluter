@@ -35,7 +35,7 @@ from homeassistant.helpers.update_coordinator import (
 )
 
 from . import SchluterData
-from .const import DOMAIN
+from .const import DOMAIN, PRESET_MANUAL, PRESET_SCHEDULE
 from .entity import SchluterEntity
 
 _LOGGER = logging.getLogger(__name__)
@@ -62,7 +62,9 @@ class SchluterThermostat(SchluterEntity, ClimateEntity):
         ClimateEntityFeature.TARGET_TEMPERATURE
         | ClimateEntityFeature.TURN_ON
         | ClimateEntityFeature.TURN_OFF
+        | ClimateEntityFeature.PRESET_MODE
     )
+    _attr_preset_modes = [PRESET_SCHEDULE, PRESET_MANUAL]
     _enable_turn_on_off_backwards_compatibility: bool = False
 
     coordinator: DataUpdateCoordinator[dict[str, dict[str, Thermostat]]]
@@ -110,6 +112,32 @@ class SchluterThermostat(SchluterEntity, ClimateEntity):
         return self._attr_hvac_mode
 
     @property
+    def preset_mode(self):
+        """Return Schedule/Manual, or None for any other regulation mode."""
+        mode = self.coordinator.data[self._attr_unique_id].regulation_mode
+        if mode == REGULATION_MODE_SCHEDULE:
+            return PRESET_SCHEDULE
+        if mode == REGULATION_MODE_MANUAL:
+            return PRESET_MANUAL
+        return None
+
+    @property
+    def extra_state_attributes(self):
+        """Expose the raw regulation mode for diagnostics."""
+        return {
+            "regulation_mode": self.coordinator.data[
+                self._attr_unique_id
+            ].regulation_mode
+        }
+
+    async def async_set_preset_mode(self, preset_mode: str) -> None:
+        """Switch between schedule and manual."""
+        if preset_mode == PRESET_SCHEDULE:
+            await self.async_set_hvac_mode(HVACMode.AUTO)
+        elif preset_mode == PRESET_MANUAL:
+            await self.async_set_hvac_mode(HVACMode.HEAT)
+
+    @property
     def unique_id(self):
         """Return unique ID for this device."""
         return self._serial_number
@@ -153,9 +181,6 @@ class SchluterThermostat(SchluterEntity, ClimateEntity):
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Set the hvac mode"""
-        if hvac_mode == self._attr_hvac_mode:
-            return
-
         serial_number = self.coordinator.data[self._attr_unique_id].serial_number
         _LOGGER.debug(
             "Setting HVAC mode of thermostat: %s to: %s", self._name, hvac_mode
