@@ -13,22 +13,29 @@ from aioschluter import (
     InvalidSessionIdError,
     InvalidUserPasswordError,
     SchluterApi,
+    Thermostat,
 )
 import async_timeout
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.core_config import Config
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .const import DOMAIN
+from .const import DOMAIN, UPDATE_INTERVAL
+from .push import SchluterPushClient
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS = [Platform.BUTTON, Platform.CLIMATE, Platform.SENSOR]
+PLATFORMS = [
+    Platform.BINARY_SENSOR,
+    Platform.BUTTON,
+    Platform.CLIMATE,
+    Platform.SENSOR,
+]
 
 
 async def async_setup(hass: HomeAssistant, config: Config) -> bool:
@@ -44,6 +51,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     coordinator = SchluterDataUpdateCoordinator(hass, api, username, password)
     await coordinator.async_config_entry_first_refresh()
+    SchluterPushClient(hass, websession, coordinator).start(entry)
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = SchluterData(
         api=api,
@@ -83,8 +91,29 @@ class SchluterDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             hass,
             _LOGGER,
             name=DOMAIN,
-            update_interval=timedelta(minutes=1),
+            update_interval=timedelta(minutes=UPDATE_INTERVAL),
         )
+
+    @property
+    def api_sessionid(self) -> str | None:
+        """The session ID the API is currently using."""
+        return self._api.sessionid
+
+    @callback
+    def async_apply_push(self, thermostat: Thermostat) -> None:
+        """Merge one thermostat pushed by the cloud into the current data."""
+        if not self.data:
+            return
+        serial = thermostat.serial_number
+        if serial not in self.data:
+            self.hass.async_create_task(self.async_request_refresh())
+            return
+        _LOGGER.debug("Push update received for %s", serial)
+        data = dict(self.data)
+        data[serial] = thermostat
+        # Unlike async_set_updated_data this keeps the polling schedule.
+        self.data = data
+        self.async_update_listeners()
 
     async def _async_update_data(self) -> dict[str, Any]:
         try:

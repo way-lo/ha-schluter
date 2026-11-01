@@ -21,3 +21,10 @@ PRESET_PERMANENT = "Permanent hold"
 # Extra refreshes after a command. The cloud applies a mode change at once but
 # the thermostat reports its new set point a little later.
 FOLLOWUP_REFRESH_DELAYS = (15, 45)
+
+# Near-instant updates (long-polling the cloud's notification endpoint).
+UPDATE_INTERVAL = 1  # minutes between polls when push is not working
+PUSH_POLL_INTERVAL = 5  # minutes between polls while push is working
+PUSH_REQUEST_TIMEOUT = 120  # seconds; the server answers within about a minute
+PUSH_RECONNECT_MIN_DELAY = 5  # seconds
+PUSH_RECONNECT_MAX_DELAY = 300  # seconds
