@@ -199,9 +199,10 @@ class SchluterEnergySensor(SchluterEntity, SensorEntity):
 class SchluterEnergyPriceSensor(SchluterEntity, SensorEntity):
     """Representation of a Sensor."""
 
+    # A rate in $/kWh is not a monetary total, so it has no device or state
+    # class (HA rejects "monetary" with "total_increasing").
     _attr_native_unit_of_measurement = "$/kWh"
-    _attr_device_class = SensorDeviceClass.MONETARY
-    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_icon = "mdi:currency-usd"
 
     def __init__(
         self,
@@ -212,9 +213,9 @@ class SchluterEnergyPriceSensor(SchluterEntity, SensorEntity):
         super().__init__(coordinator, thermostat_id)
         self._attr_name = coordinator.data[thermostat_id].name + " Price"
         self._thermostat_id = thermostat_id
-        self._attr_unique_id = (
-            f"{coordinator.data[thermostat_id].name}-{self._attr_device_class}"
-        )
+        # Keep the original ID ("-monetary" came from the old device class) so
+        # existing installs keep the same entity.
+        self._attr_unique_id = f"{coordinator.data[thermostat_id].name}-monetary"
 
     @property
     def device_info(self):
