@@ -1,6 +1,7 @@
 """Support for Schluter DITRA-HEAT-E-WIFI Thermostats."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import logging
 
 from aiohttp.client_exceptions import ClientConnectorError
@@ -58,6 +59,22 @@ async def async_setup_entry(
         SchluterThermostat(data.api, data.coordinator, thermostat_id)
         for thermostat_id in data.coordinator.data
     )
+
+
+def _comfort_expired(end_time) -> bool:
+    """Return True if a temporary hold's end time (UTC) is already past.
+
+    The cloud keeps ComfortTemperature after a hold ends, so it must only be
+    used while ComfortEndTime is in the future. The format is
+    "dd/mm/yyyy HH:MM:SS +00:00". If it cannot be parsed, assume not expired.
+    """
+    if not end_time:
+        return False
+    try:
+        end = datetime.strptime(str(end_time), "%d/%m/%Y %H:%M:%S %z")
+    except ValueError:
+        return False
+    return end <= datetime.now(timezone.utc)
 
 
 class SchluterThermostat(SchluterEntity, ClimateEntity):
@@ -154,7 +171,9 @@ class SchluterThermostat(SchluterEntity, ClimateEntity):
         thermostat = self._thermostat
         mode = thermostat.regulation_mode
         raw = None
-        if mode == MODE_TEMPORARY_HOLD:
+        if mode == MODE_TEMPORARY_HOLD and not _comfort_expired(
+            getattr(thermostat, "_comfort_end_time", None)
+        ):
             raw = getattr(thermostat, "_comfort_temperature", None)
         elif mode == MODE_PERMANENT_HOLD:
             raw = getattr(thermostat, "_manual_temp", None)

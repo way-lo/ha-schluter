@@ -35,13 +35,18 @@ class SchluterEnergyPriceNumber(SchluterEntity, NumberEntity):
     portal. The cloud applies it to all past usage as well, not only to
     energy used from now on, so changing it rewrites the cost the Schluter
     app and portal show for earlier days.
+
+    The cloud accepts up to four decimals, but the thermostat itself keeps
+    only two and truncates (0.0893 becomes 0.08, not 0.09). It writes its own
+    copy back to the cloud at its next schedule transition, so use two
+    decimals.
     """
 
     _attr_icon = "mdi:currency-usd"
     _attr_native_unit_of_measurement = "$/kWh"
     _attr_native_min_value = 0
     _attr_native_max_value = 5
-    _attr_native_step = 0.0001
+    _attr_native_step = 0.01
     _attr_mode = NumberMode.BOX
 
     def __init__(self, api, coordinator, thermostat_id: str) -> None:
