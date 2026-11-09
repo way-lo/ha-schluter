@@ -1,4 +1,6 @@
 """Break out the temperature of the thermostat into a separate sensor entity."""
+from datetime import datetime, timezone
+
 from aioschluter import Thermostat
 
 from homeassistant.components.sensor import (
@@ -10,8 +12,9 @@ from homeassistant.const import UnitOfTemperature, UnitOfEnergy, UnitOfPower
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from . import SchluterData
-from .const import DOMAIN, ZERO_WATTS
+from .const import DOMAIN, MODE_TEMPORARY_HOLD, ZERO_WATTS
 from .entity import SchluterEntity
+from .helpers import parse_comfort_end
 
 
 async def async_setup_entry(hass, config_entry, async_add_entities):
@@ -39,6 +42,12 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
     # Add the price per kwh Sensor
     async_add_entities(
         SchluterEnergyPriceSensor(data.coordinator, thermostat_id)
+        for thermostat_id in data.coordinator.data
+    )
+
+    # Add the temporary hold end time Sensor
+    async_add_entities(
+        SchluterComfortEndSensor(data.coordinator, thermostat_id)
         for thermostat_id in data.coordinator.data
     )
 
@@ -228,3 +237,40 @@ class SchluterEnergyPriceSensor(SchluterEntity, SensorEntity):
     def native_value(self) -> float:
         """Return the state of the sensor."""
         return self.coordinator.data[self._thermostat_id].kwh_charge
+
+
+class SchluterComfortEndSensor(SchluterEntity, SensorEntity):
+    """When the current temporary hold ends (unknown if there is none)."""
+
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_icon = "mdi:timer-outline"
+
+    def __init__(
+        self,
+        coordinator: DataUpdateCoordinator[dict[str, dict[str, Thermostat]]],
+        thermostat_id: str,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, thermostat_id)
+        thermostat = coordinator.data[thermostat_id]
+        self._thermostat_id = thermostat_id
+        self._attr_name = thermostat.name + " Comfort end time"
+        self._attr_unique_id = f"{thermostat.serial_number}_comfort_end_time"
+
+    @property
+    def device_info(self):
+        """Return information to link this entity."""
+        return {
+            "identifiers": {(DOMAIN, self._thermostat_id)},
+        }
+
+    @property
+    def native_value(self) -> datetime | None:
+        """Return the end of the temporary hold, only while one is active."""
+        thermostat = self.coordinator.data[self._thermostat_id]
+        if thermostat.regulation_mode != MODE_TEMPORARY_HOLD:
+            return None
+        end = parse_comfort_end(getattr(thermostat, "_comfort_end_time", None))
+        if end is None or end <= datetime.now(timezone.utc):
+            return None
+        return end

@@ -1,7 +1,7 @@
 """Support for Schluter DITRA-HEAT-E-WIFI Thermostats."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import logging
 
 from aiohttp.client_exceptions import ClientConnectorError
@@ -11,6 +11,12 @@ from aioschluter import (
     InvalidUserPasswordError,
     SchluterApi,
     Thermostat,
+)
+from aioschluter.const import (
+    API_GET_THERMOSTATS_URL,
+    API_SET_THERMOSTAT_URL,
+    HTTP_OK,
+    HTTP_UNAUTHORIZED,
 )
 
 from homeassistant.components.climate import ClimateEntity
@@ -23,8 +29,10 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.util import dt as dt_util
 
 from . import SchluterData
 from .const import (
@@ -37,8 +45,12 @@ from .const import (
     PRESET_TEMPORARY,
 )
 from .entity import SchluterEntity
+from .helpers import format_comfort_end, next_schedule_event, parse_comfort_end
 
 _LOGGER = logging.getLogger(__name__)
+
+# Used when the schedule cannot be read: a hold of this length.
+FALLBACK_HOLD = timedelta(hours=4)
 
 _PRESET_TO_MODE = {
     PRESET_SCHEDULE: MODE_SCHEDULE,
@@ -65,16 +77,11 @@ def _comfort_expired(end_time) -> bool:
     """Return True if a temporary hold's end time (UTC) is already past.
 
     The cloud keeps ComfortTemperature after a hold ends, so it must only be
-    used while ComfortEndTime is in the future. The format is
-    "dd/mm/yyyy HH:MM:SS +00:00". If it cannot be parsed, assume not expired.
+    used while ComfortEndTime is in the future. If the end time cannot be
+    parsed, assume it has not expired.
     """
-    if not end_time:
-        return False
-    try:
-        end = datetime.strptime(str(end_time), "%d/%m/%Y %H:%M:%S %z")
-    except ValueError:
-        return False
-    return end <= datetime.now(timezone.utc)
+    end = parse_comfort_end(end_time)
+    return end is not None and end <= datetime.now(timezone.utc)
 
 
 class SchluterThermostat(SchluterEntity, ClimateEntity):
@@ -220,7 +227,72 @@ class SchluterThermostat(SchluterEntity, ClimateEntity):
             raise HomeAssistantError(f"Schluter request failed: {err}") from err
         await self.async_refresh_after_command()
 
+    async def _async_fetch_schedules(self) -> list | None:
+        """Read this thermostat's schedule from the cloud (the library drops it)."""
+        session = async_get_clientsession(self.hass)
+        async with session.get(
+            API_GET_THERMOSTATS_URL, params={"sessionId": self._api.sessionid}
+        ) as resp:
+            if resp.status == HTTP_UNAUTHORIZED:
+                raise InvalidSessionIdError("Expired Schluter session")
+            if resp.status != HTTP_OK:
+                raise ApiError(f"Invalid Response: {resp.status}")
+            payload = await resp.json(content_type=None)
+        for group in payload.get("Groups", []):
+            for thermostat in group.get("Thermostats", []):
+                if str(thermostat.get("SerialNumber")) == str(self._serial_number):
+                    return thermostat.get("Schedules")
+        return None
+
+    async def _async_set_temporary_hold(self) -> None:
+        """Hold the comfort temperature until the next scheduled event.
+
+        This is what the Schluter app does. The cloud ignores the mode change
+        alone when the stored end time has passed, so the comfort temperature
+        and a new end time are sent together.
+        """
+        now = dt_util.now()
+        end = None
+        try:
+            end = next_schedule_event(await self._async_fetch_schedules(), now)
+        except (InvalidSessionIdError, ApiError, ClientConnectorError, ValueError) as err:
+            _LOGGER.warning("Could not read the schedule (%s); holding for 4 hours", err)
+        if end is None:
+            end = now + FALLBACK_HOLD
+        comfort = getattr(self._thermostat, "_comfort_temperature", None)
+        body = {
+            "RegulationMode": MODE_TEMPORARY_HOLD,
+            "VacationEnabled": False,
+            "ComfortEndTime": format_comfort_end(end),
+        }
+        if comfort is not None:
+            body["ComfortTemperature"] = comfort
+        _LOGGER.debug("Temporary hold of %s until %s: %s", self._name, end, body)
+
+        async def _post() -> None:
+            session = async_get_clientsession(self.hass)
+            async with session.post(
+                API_SET_THERMOSTAT_URL,
+                params={
+                    "sessionId": self._api.sessionid,
+                    "serialnumber": self._serial_number,
+                },
+                json=body,
+            ) as resp:
+                if resp.status == HTTP_UNAUTHORIZED:
+                    raise InvalidSessionIdError("Expired Schluter session")
+                if resp.status != HTTP_OK:
+                    raise ApiError(f"Invalid Response: {resp.status}")
+                result = await resp.json(content_type=None)
+            if isinstance(result, dict) and result.get("Success") is False:
+                raise ApiError("The Schluter cloud rejected the temporary hold")
+
+        await self._async_send(_post)
+
     async def _async_set_mode(self, mode: int) -> None:
+        if mode == MODE_TEMPORARY_HOLD:
+            await self._async_set_temporary_hold()
+            return
         _LOGGER.debug("Setting regulation mode of %s to %s", self._name, mode)
         await self._async_send(
             lambda: self._api.async_set_regulation_mode(
